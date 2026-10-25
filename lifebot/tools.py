@@ -30,6 +30,8 @@ def task_line(task: Task, today: date, show_list: bool = False) -> str:
         parts.append("🔔")
     if task.repeat != "none":
         parts.append(f"🔁 {REPEATS[task.repeat]}")
+    if task.calendar:
+        parts.append("📆")
     if show_list and task.list != DEFAULT_LIST:
         parts.append(f"[{task.list}]")
     return f"#{task.id} " + " ".join(parts)
@@ -143,9 +145,11 @@ def snooze(s: Storage, task: Task, now: datetime, minutes: int | None) -> str:
 class ChatTools:
     """Инструменты Claude: каждый метод соответствует инструменту в assistant.TOOLS."""
 
-    def __init__(self, chat: Chat, s: Storage, now: datetime) -> None:
+    def __init__(self, chat: Chat, s: Storage, now: datetime, calendar_ready: bool = False) -> None:
         self.chat, self.s, self.now = chat, s, now
+        self.calendar_ready = calendar_ready  # есть ключ Google и выбран календарь
         self.changed: list[int] = []  # дела, созданные или изменённые в этом ответе
+        self.deleted_events: list[str] = []  # события календаря, которые нужно удалить
 
     @property
     def tz(self):
@@ -203,10 +207,25 @@ class ChatTools:
                     f"в {task.remind_at.astimezone(self.tz):%H:%M}"
         elif task.remind_before is not None:
             line += "; срок уже прошёл, напоминания не будет"
+        if task.calendar:
+            line += ("; будет в Google Календаре" if self.calendar_ready
+                     else "; Google Календарь не подключён — записано только в боте")
         return line
 
+    @staticmethod
+    def _duration(value: int) -> int | None:
+        if value <= 0:
+            return None
+        return min(value, 60 * 24 * 14)
+
+    @staticmethod
+    def _text(value: str) -> str | None:
+        value = value.strip()
+        return None if value.lower() in ("", "none") else value
+
     def add_task(self, title: str, list: str, due_date: str, due_time: str,
-                 remind_minutes_before: str, repeat: str) -> str:
+                 remind_minutes_before: str, repeat: str, calendar: bool = False,
+                 duration_minutes: int = 0, location: str = "none", details: str = "none") -> str:
         if not title.strip():
             raise ValueError("пустое название дела")
         day, time = self._when(due_date, due_time)
@@ -215,13 +234,18 @@ class ChatTools:
             raise ValueError("для напоминания нужно время срока (due_time)")
         if repeat != "none" and day is None:
             day = self.now.date()
+        if calendar and day is None:
+            raise ValueError("для события в календаре нужна дата (due_date)")
         task_id = self.s.add_task(self.chat.chat_id, title.strip(), list.strip().lower() or DEFAULT_LIST,
-                                  day, time, remind, repeat=repeat)
+                                  day, time, remind, repeat=repeat, calendar=calendar,
+                                  duration=self._duration(duration_minutes), location=self._text(location),
+                                  details=self._text(details))
         self._touch(task_id)
         return "Записано: " + self._describe(self._apply_schedule(task_id))
 
     def update_task(self, task_id: int, title: str, list: str, due_date: str, due_time: str,
-                    remind_minutes_before: str, repeat: str) -> str:
+                    remind_minutes_before: str, repeat: str, calendar: str = "keep",
+                    duration_minutes: int = -1, location: str = "keep", details: str = "keep") -> str:
         task = self._task(task_id)
         fields: dict = {}
         if title != "keep":
@@ -239,6 +263,19 @@ class ChatTools:
             fields["repeat"] = repeat
             if repeat != "none" and not fields.get("due_date", task.due_date):
                 fields["due_date"] = self.now.date()
+        if duration_minutes >= 0:
+            fields["duration"] = self._duration(duration_minutes)
+        if location != "keep":
+            fields["location"] = self._text(location)
+        if details != "keep":
+            fields["details"] = self._text(details)
+        if calendar != "keep":
+            fields["calendar"] = calendar == "yes"
+            if not fields["calendar"] and task.event_id:
+                self.deleted_events.append(task.event_id)
+                fields["event_id"] = None
+        if fields.get("calendar", task.calendar) and not fields.get("due_date", task.due_date):
+            raise ValueError("для события в календаре нужна дата (due_date)")
         self.s.update_task(self.chat.chat_id, task_id, **fields)
         self._touch(task_id)
         return "Изменено: " + self._describe(self._apply_schedule(task_id))
@@ -249,6 +286,8 @@ class ChatTools:
     def delete_task(self, task_id: int) -> str:
         task = self._task(task_id)
         self.s.delete_task(self.chat.chat_id, task_id)
+        if task.event_id:
+            self.deleted_events.append(task.event_id)
         if task_id in self.changed:
             self.changed.remove(task_id)
         return f"Удалено: #{task_id} {task.title}"
@@ -324,6 +363,8 @@ class ChatTools:
             f"Сейчас: {human_now(self.now)} ({self.chat.tz}).",
             f"Утренняя сводка: {self.chat.digest_time or 'выключена'}.",
             f"Заметок: {len(self.s.notes(self.chat.chat_id))} (содержимое — через search_notes).",
+            "Google Календарь: " + ("подключён." if self.calendar_ready else
+                                    "не подключён (события пишутся только в бот; подключить — /calendar)."),
         ]
         if not tasks:
             lines.append("Открытых дел нет.")
@@ -341,6 +382,9 @@ class ChatTools:
                 parts.append(f"напоминание {t.remind_at.astimezone(self.tz):%d.%m %H:%M}")
             if t.repeat != "none":
                 parts.append(f"повтор {t.repeat}")
+            if t.calendar:
+                extra = ", ".join(x for x in [f"{t.duration or 60} мин", t.location, t.details] if x)
+                parts.append(f"в календаре ({extra})")
             lines.append("; ".join(parts))
         if len(tasks) > MAX_STATE_TASKS:
             lines.append(f"…и ещё {len(tasks) - MAX_STATE_TASKS}")

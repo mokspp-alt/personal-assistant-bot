@@ -12,7 +12,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY,
     tz TEXT NOT NULL DEFAULT 'Europe/Moscow',
-    digest_time TEXT DEFAULT '08:30'
+    digest_time TEXT DEFAULT '08:30',
+    calendar_id TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +26,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     remind_at TEXT,
     repeat TEXT NOT NULL DEFAULT 'none',
     done_at TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    calendar INTEGER NOT NULL DEFAULT 0,
+    event_id TEXT,
+    duration INTEGER,
+    location TEXT,
+    details TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_chat ON tasks (chat_id, done_at);
 CREATE TABLE IF NOT EXISTS notes (
@@ -45,8 +51,15 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# Колонки, добавленные после первой версии, — для баз, созданных раньше.
+MIGRATIONS = {
+    "chats": {"calendar_id": "TEXT"},
+    "tasks": {"calendar": "INTEGER NOT NULL DEFAULT 0", "event_id": "TEXT", "duration": "INTEGER",
+              "location": "TEXT", "details": "TEXT"},
+}
 DEFAULT_LIST = "дела"
-TASK_FIELDS = {"title", "list", "due_date", "due_time", "remind_before", "remind_at", "repeat", "done_at"}
+TASK_FIELDS = {"title", "list", "due_date", "due_time", "remind_before", "remind_at", "repeat", "done_at",
+               "calendar", "event_id", "duration", "location", "details"}
 
 
 @dataclass
@@ -54,6 +67,7 @@ class Chat:
     chat_id: int
     tz: str
     digest_time: str | None  # "08:30" или None — сводку не присылать
+    calendar_id: str | None = None  # Google Календарь, куда писать события
 
     @property
     def zone(self) -> ZoneInfo:
@@ -73,6 +87,11 @@ class Task:
     repeat: str
     done_at: datetime | None
     created_at: datetime
+    calendar: bool = False  # дублировать событием в Google Календаре
+    event_id: str | None = None
+    duration: int | None = None  # минут, для события в календаре
+    location: str | None = None
+    details: str | None = None
 
     def due_at(self, tz) -> datetime | None:
         if not (self.due_date and self.due_time):
@@ -109,6 +128,7 @@ def _task(r: sqlite3.Row) -> Task:
         date.fromisoformat(r["due_date"]) if r["due_date"] else None,
         r["due_time"], r["remind_before"], _dt(r["remind_at"]), r["repeat"],
         _dt(r["done_at"]), datetime.fromisoformat(r["created_at"]),
+        bool(r["calendar"]), r["event_id"], r["duration"], r["location"], r["details"],
     )
 
 
@@ -119,6 +139,11 @@ class Storage:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        for table, columns in MIGRATIONS.items():
+            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, sql in columns.items():
+                if name not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql}")
         self.db.commit()
 
     # --- чаты ---
@@ -127,7 +152,7 @@ class Storage:
         self.db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
         self.db.commit()
         r = self.db.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
-        return Chat(r["chat_id"], r["tz"], r["digest_time"])
+        return Chat(r["chat_id"], r["tz"], r["digest_time"], r["calendar_id"])
 
     def chats(self) -> list[Chat]:
         ids = [r[0] for r in self.db.execute("SELECT chat_id FROM chats")]
@@ -136,7 +161,7 @@ class Storage:
     def update_chat(self, chat_id: int, **fields) -> None:
         self.chat(chat_id)
         for name, value in fields.items():
-            assert name in {"tz", "digest_time"}
+            assert name in {"tz", "digest_time", "calendar_id"}
             self.db.execute(f"UPDATE chats SET {name} = ? WHERE chat_id = ?", (value, chat_id))
         self.db.commit()
 
@@ -144,12 +169,15 @@ class Storage:
 
     def add_task(self, chat_id: int, title: str, list: str = DEFAULT_LIST, due_date: date | None = None,
                  due_time: str | None = None, remind_before: int | None = None,
-                 remind_at: datetime | None = None, repeat: str = "none") -> int:
+                 remind_at: datetime | None = None, repeat: str = "none", calendar: bool = False,
+                 duration: int | None = None, location: str | None = None, details: str | None = None) -> int:
         cur = self.db.execute(
             "INSERT INTO tasks (chat_id, title, list, due_date, due_time, remind_before, remind_at, "
-            "repeat, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "repeat, created_at, calendar, duration, location, details) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (chat_id, title, list, due_date.isoformat() if due_date else None, due_time, remind_before,
-             _utc(remind_at) if remind_at else None, repeat, _utc(datetime.now(timezone.utc))),
+             _utc(remind_at) if remind_at else None, repeat, _utc(datetime.now(timezone.utc)),
+             int(calendar), duration, location, details),
         )
         self.db.commit()
         return cur.lastrowid

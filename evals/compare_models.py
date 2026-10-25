@@ -43,9 +43,18 @@ PRICES = {
 
 
 def task(title: str, list: str = "дела", due_date: str = "none", due_time: str = "none",
-         remind: str = "none", repeat: str = "none") -> tuple[str, dict]:
+         remind: str = "none", repeat: str = "none", calendar: bool = False, duration: int = 0,
+         location: str = "none", details: str = "none") -> tuple[str, dict]:
     return ("add_task", dict(title=title, list=list, due_date=due_date, due_time=due_time,
-                             remind_minutes_before=remind, repeat=repeat))
+                             remind_minutes_before=remind, repeat=repeat, calendar=calendar,
+                             duration_minutes=duration, location=location, details=details))
+
+
+def update(task_id: int, **changes) -> tuple[str, dict]:
+    args = dict(task_id=task_id, title="keep", list="keep", due_date="keep", due_time="keep",
+                remind_minutes_before="keep", repeat="keep", calendar="keep", duration_minutes=-1,
+                location="keep", details="keep")
+    return ("update_task", {**args, **changes})
 
 
 @dataclass
@@ -57,10 +66,11 @@ class Case:
     reply: list[str] = field(default_factory=list)  # регулярки, которые должны быть в ответе
     setup: list[tuple[str, dict]] = field(default_factory=list)  # действия до сообщения (дела #1, #2…)
     notes: list[str] = field(default_factory=list)  # регулярки: должны быть среди заметок
+    locations: list[str] = field(default_factory=list)  # регулярки: место события в календаре
     now: datetime = NOW
 
 
-HAIRCUT = task("Стрижка", due_date="30.10.2026", due_time="18:00", remind="60")
+HAIRCUT = task("Стрижка", due_date="30.10.2026", due_time="18:00", remind="60", calendar=True, duration=60)
 SHOPPING = [task("Молоко", "покупки"), task("Хлеб", "покупки")]
 DOOR_CODE = ("add_note", dict(text="Код домофона: 45К1234"))
 
@@ -80,19 +90,22 @@ CASES = [
          [task("Выпить таблетку", due_date="today", due_time="21:00", remind="0", repeat="daily")],
          [r"таблет"]),
     Case("день рождения", "12 марта день рождения у Оли",
-         [task("День рождения Оли", due_date="12.03.2027", repeat="yearly")], [r"Ол"]),
+         [task("День рождения Оли", due_date="12.03.2027", repeat="yearly", calendar=True)], [r"Ол"]),
+    Case("билет на поезд", "Жена пишет: надо встретить маму. Билет: поезд 016А Мурманск — Москва, "
+         "прибытие 30.10 в 07:52, Ленинградский вокзал, вагон 5, место 12",
+         [task("Встретить маму", due_date="30.10.2026", due_time="07:52", remind="90", calendar=True,
+               duration=60, location="Ленинградский вокзал", details="Поезд 016А, вагон 5, место 12")],
+         [r"встрет"], locations=[r"Ленинград"]),
     Case("распознавание речи", "напомни в понедельник в восемь утра вынести мусор",
          [task("Вынести мусор", due_date="26.10.2026", due_time="08:00", remind="0")], [r"мусор"]),
     # --- изменения ---
-    Case("купил", "молоко купил", [("complete_task", dict(task_id=1))], [r"хлеб"], setup=SHOPPING),
+    Case("купил", "молоко купил", [("complete_task", {"task_id": 1})], [r"хлеб"], setup=SHOPPING),
     Case("перенеси", "перенеси стрижку на субботу",
-         [("update_task", dict(task_id=1, title="keep", list="keep", due_date="31.10.2026",
-                               due_time="keep", remind_minutes_before="keep", repeat="keep"))],
+         [update(1, due_date="31.10.2026")],
          [r"стриж"], setup=[HAIRCUT]),
     Case("отменили", "стрижку отменили", [("delete_task", dict(task_id=1))], setup=[HAIRCUT]),
     Case("напомни раньше", "по стрижке напомни за два часа",
-         [("update_task", dict(task_id=1, title="keep", list="keep", due_date="keep",
-                               due_time="keep", remind_minutes_before="120", repeat="keep"))],
+         [update(1, remind_minutes_before="120")],
          [r"стриж"], setup=[HAIRCUT]),
     # --- заметки и вопросы ---
     Case("запомни", "запомни: код домофона 45К1234", [DOOR_CODE], notes=[r"45К1234"]),
@@ -107,15 +120,17 @@ CASES = [
 
 
 def fresh(case: Case) -> tuple[Storage, ChatTools]:
+    """Календарь «подключён»: в базе выбран, в Google ничего не уходит — сверяем только базу."""
     s = Storage(":memory:")
-    tools = ChatTools(s.chat(1), s, case.now)
+    s.update_chat(1, calendar_id="me@gmail.com")
+    tools = ChatTools(s.chat(1), s, case.now, calendar_ready=True)
     for name, args in case.setup:
         getattr(tools, name)(**args)
-    return s, ChatTools(s.chat(1), s, case.now)
+    return s, ChatTools(s.chat(1), s, case.now, calendar_ready=True)
 
 
 def snapshot(s: Storage) -> tuple:
-    tasks = sorted((t.list, str(t.due_date), t.due_time, t.remind_before, t.repeat)
+    tasks = sorted((t.list, str(t.due_date), t.due_time, t.remind_before, t.repeat, t.calendar)
                    for t in s.open_tasks(1))
     return tuple(tasks), len(s.notes(1)), s.chat(1).tz, s.chat(1).digest_time
 
@@ -178,6 +193,10 @@ async def run_case(assistant: Assistant, case: Case) -> Result:
     for pattern in case.titles:
         if not any(re.search(pattern, t, re.IGNORECASE) for t in titles):
             problems.append(f"нет дела /{pattern}/ среди {titles}")
+    locations = [t.location or "" for t in s.open_tasks(1)]
+    for pattern in case.locations:
+        if not any(re.search(pattern, x, re.I) for x in locations):
+            problems.append(f"нет места /{pattern}/ среди {locations}")
     notes = [n.text for n in s.notes(1)]
     for pattern in case.notes:
         if not any(re.search(pattern, n, re.IGNORECASE) for n in notes):

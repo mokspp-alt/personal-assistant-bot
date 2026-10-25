@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -17,7 +18,7 @@ from telegram.ext import (
     MessageHandler, TypeHandler, filters,
 )
 
-from . import attachments
+from . import attachments, gcal
 from .assistant import Assistant
 from .dates import parse_hhmm
 from .storage import Chat, Storage, Task
@@ -49,12 +50,48 @@ HELP = (
     "/notes — заметки\n"
     "/done 12 — отметить дело #12 выполненным, /del 12 — удалить\n"
     "/digest 08:30 — время утренней сводки (off — не присылать)\n"
+    "/calendar — Google Календарь: подключение и проверка\n"
     "/tz Europe/Moscow — часовой пояс"
+)
+
+
+CALENDAR_KEY_HELP = (
+    "Чтобы события попадали в Google Календарь, нужен ключ служебного аккаунта Google. "
+    "Всё делается в Safari, можно с телефона:\n"
+    "1. console.cloud.google.com → создайте проект (Create project), имя любое, например assistant.\n"
+    "2. APIs & Services → Library → найдите Google Calendar API → Enable.\n"
+    "3. IAM & Admin → Service Accounts → Create service account → имя любое → Done.\n"
+    "4. Откройте созданный аккаунт → Keys → Add key → Create new key → JSON. Файл скачается.\n"
+    "5. Пришлите этот .json файлом сюда. Я сохраню ключ на сервере и удалю сообщение."
+)
+CALENDAR_SHARE_HELP = (
+    "Теперь откройте боту доступ к своему календарю:\n"
+    "1. calendar.google.com в Safari → «аА» → «Полная версия сайта».\n"
+    "2. Шестерёнка → Настройки → слева ваш календарь → «Открыть доступ пользователям» "
+    "(Share with specific people) → Добавить → {email}\n"
+    "   права: «Внесение изменений в мероприятия» (Make changes to events) → Отправить.\n"
+    "3. Напишите мне: /calendar ваш_адрес@gmail.com"
 )
 
 
 def store(context: ContextTypes.DEFAULT_TYPE) -> Storage:
     return context.application.bot_data["storage"]
+
+
+def calendar_of(context: ContextTypes.DEFAULT_TYPE) -> gcal.GoogleCalendar | None:
+    return context.application.bot_data.get("calendar")
+
+
+def make_tools(context: ContextTypes.DEFAULT_TYPE, chat: Chat) -> ChatTools:
+    return ChatTools(chat, store(context), now_for(chat),
+                     calendar_ready=calendar_of(context) is not None and bool(chat.calendar_id))
+
+
+async def sync_calendar(context: ContextTypes.DEFAULT_TYPE, chat: Chat, task_ids: list[int],
+                        deleted_events: list[str] | None = None) -> str:
+    """Переносит изменения в Google Календарь; возвращает предупреждение для ответа или пустую строку."""
+    errors = await gcal.sync(calendar_of(context), store(context), chat, task_ids, deleted_events or [])
+    return "\n\n⚠️ Google Календарь: " + "; ".join(errors) if errors else ""
 
 
 def tz_of(chat: Chat):
@@ -197,7 +234,59 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if task := await _task_arg(update, context):
         store(context).delete_task(task.chat_id, task.id)
-        await reply(update, f"🗑 Удалено: {task.title}")
+        chat = store(context).chat(update.effective_chat.id)
+        warning = await sync_calendar(context, chat, [], [task.event_id] if task.event_id else [])
+        await reply(update, f"🗑 Удалено: {task.title}{warning}")
+
+
+async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/calendar — состояние и подсказка; /calendar адрес@gmail.com — выбрать календарь; off — отключить."""
+    s = store(context)
+    chat = s.chat(update.effective_chat.id)
+    cal = calendar_of(context)
+    arg = (context.args or [""])[0].strip()
+    if arg.lower() == "off":
+        s.update_chat(chat.chat_id, calendar_id=None)
+        await reply(update, "Google Календарь отключён: события больше не создаю.")
+        return
+    if cal is None:
+        await reply(update, CALENDAR_KEY_HELP)
+        return
+    if not arg and not chat.calendar_id:
+        await reply(update, f"Ключ Google есть, адрес бота: {cal.email}\n\n"
+                            + CALENDAR_SHARE_HELP.format(email=cal.email))
+        return
+    calendar_id = arg or chat.calendar_id
+    try:
+        name = await cal.check(calendar_id)
+    except Exception as e:
+        log.exception("Календарь %s недоступен", calendar_id)
+        await reply(update, f"Не получается открыть календарь {calendar_id}: {e}\n\n"
+                            + CALENDAR_SHARE_HELP.format(email=cal.email))
+        return
+    s.update_chat(chat.chat_id, calendar_id=calendar_id)
+    await reply(update, f"✅ Google Календарь подключён: «{name}». Встречи, поездки и всё, что попросите "
+                        "«в календарь», буду добавлять туда с оповещениями. Отключить: /calendar off")
+
+
+async def save_calendar_key(update: Update, context: ContextTypes.DEFAULT_TYPE, data: bytes) -> bool:
+    """Если прислан JSON-ключ служебного аккаунта Google — сохраняет его. True — это был ключ."""
+    try:
+        info = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(info, dict) or not gcal.is_service_account(info):
+        return False
+    gcal.save_key(info)
+    context.application.bot_data["calendar"] = gcal.GoogleCalendar.from_env()
+    try:  # в переписке ключу лежать незачем
+        await update.effective_message.delete()
+    except Exception:
+        log.warning("Не удалось удалить сообщение с ключом")
+    await update.effective_chat.send_message(
+        f"🔑 Ключ Google сохранён на сервере, сообщение с ним удалил.\n\nАдрес бота: {info['client_email']}\n\n"
+        + CALENDAR_SHARE_HELP.format(email=info["client_email"]), reply_markup=KEYBOARD)
+    return True
 
 
 async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -206,7 +295,7 @@ async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await reply(update, f"Часовой пояс: {chat.tz}. Сменить: /tz Europe/Moscow")
         return
-    tools = ChatTools(chat, s, now_for(chat))
+    tools = make_tools(context, chat)
     try:
         await reply(update, tools.update_settings("timezone", context.args[0]))
     except ValueError as e:
@@ -220,7 +309,7 @@ async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await reply(update, f"Утренняя сводка: {chat.digest_time or 'выключена'}. "
                             "Изменить: /digest 08:30 или /digest off")
         return
-    tools = ChatTools(chat, s, now_for(chat))
+    tools = make_tools(context, chat)
     try:
         await reply(update, tools.update_settings("digest_time", context.args[0]))
     except ValueError as e:
@@ -238,15 +327,16 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
     if assistant is None:
         return False
     s = store(context)
-    tools = ChatTools(chat, s, now_for(chat))
+    tools = make_tools(context, chat)
     try:
         reply_text = await assistant.handle(chat.chat_id, text, tools, files, label)
     except Exception:
-        if not tools.changed:
+        if not (tools.changed or tools.deleted_events):
             log.exception("Claude недоступен")
             return False
         log.exception("Claude оборвался после изменений")
         reply_text = "Изменения внесены, но ответ не получился. Проверьте /list."
+    reply_text += await sync_calendar(context, s.chat(chat.chat_id), tools.changed, tools.deleted_events)
     tasks = [t for t in (s.task(chat.chat_id, i) for i in tools.changed) if t and t.done_at is None]
     markup = task_keyboard(tasks[0]) if len(tasks) == 1 else None
     await reply(update, heard + reply_text, markup)
@@ -310,6 +400,11 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото и документы: Claude извлекает данные, пересказывает и записывает сроки."""
     message = update.effective_message
     chat = store(context).chat(update.effective_chat.id)
+    document = message.document
+    if document and (document.file_name or "").lower().endswith(".json") and (document.file_size or 0) < 50_000:
+        data = bytes(await (await document.get_file()).download_as_bytearray())
+        if await save_calendar_key(update, context, data):
+            return
     if context.application.bot_data.get("assistant") is None:
         await message.reply_text("Чтобы разбирать фото и файлы, боту нужен Claude (ANTHROPIC_API_KEY).")
         return
@@ -354,8 +449,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif action == "del":
         s.delete_task(chat.chat_id, task.id)
         result = f"🗑 Удалено: {task.title}"
+        result += await sync_calendar(context, chat, [], [task.event_id] if task.event_id else [])
     elif action == "snz":
         result = "⏰ " + snooze(s, task, now, None if arg[0] == "tmr" else int(arg[0]))
+        if arg[0] == "tmr" and task.repeat == "none":  # срок сдвинулся — двигаем и событие
+            result += await sync_calendar(context, chat, [task.id])
     else:
         await query.answer()
         return
@@ -414,6 +512,8 @@ def main() -> None:
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "data/assistant.db"))
     app.bot_data["stt"] = Transcriber()
     app.bot_data["assistant"] = Assistant.from_env()
+    app.bot_data["calendar"] = gcal.GoogleCalendar.from_env()
+    log.info("Google Календарь: %s", "ключ есть" if app.bot_data["calendar"] else "не подключён")
     log.info("Claude: %s", "включён" if app.bot_data["assistant"] else "выключен (нет ANTHROPIC_API_KEY)")
 
     app.add_handler(TypeHandler(Update, guard), group=-1)
@@ -426,6 +526,7 @@ def main() -> None:
     app.add_handler(CommandHandler("del", del_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("digest", digest_cmd))
+    app.add_handler(CommandHandler("calendar", calendar_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_file))
