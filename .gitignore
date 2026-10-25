@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.db
+.env
+.pytest_cache/
+data/
+evals/results-*.txt
