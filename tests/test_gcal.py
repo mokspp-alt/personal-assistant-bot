@@ -243,3 +243,19 @@ def test_old_database_migrates(tmp_path):
     assert s.chat(1).calendar_id is None
     task = s.task(1, 1)
     assert task.title == "Старое дело" and task.calendar is False and task.event_id is None
+
+
+def test_other_private_keys_never_go_to_claude():
+    s = Storage(":memory:")
+    a = fake_assistant([])
+
+    async def get_file():
+        async def download_as_bytearray():
+            return bytearray(b'{"type": "other", "key": "-----BEGIN PRIVATE KEY-----..."}')
+        return SimpleNamespace(download_as_bytearray=download_as_bytearray)
+
+    sent = Sent()
+    document = SimpleNamespace(file_name="key.json", file_size=200, get_file=get_file)
+    update = fake_update(sent, message_extra=dict(document=document, photo=None, caption=None))
+    run(bot.on_file(update, fake_context(s, a)))
+    assert "Такие файлы никуда не отправляю" in sent.texts and a.client.beta.messages.calls == []

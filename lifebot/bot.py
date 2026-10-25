@@ -10,6 +10,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import anthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import NetworkError
@@ -319,6 +320,30 @@ async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # --- сообщения ----------------------------------------------------------------------------
 
 
+def claude_problem(e: Exception) -> str:
+    """Причина сбоя Claude простыми словами — чтобы было понятно, что чинить на сервере."""
+    if isinstance(e, anthropic.AuthenticationError):
+        return "ключ ANTHROPIC_API_KEY не подходит"
+    if isinstance(e, anthropic.PermissionDeniedError):
+        return "у ключа ANTHROPIC_API_KEY нет доступа"
+    if isinstance(e, anthropic.NotFoundError):
+        return "модель не найдена — проверьте CLAUDE_MODEL"
+    if isinstance(e, anthropic.RateLimitError):
+        return "слишком много запросов, подождите минуту"
+    if isinstance(e, anthropic.APITimeoutError):
+        return "Claude не ответил вовремя"
+    if isinstance(e, anthropic.APIConnectionError):
+        return "нет связи с API Anthropic — проверьте прокси ANTHROPIC_PROXY"
+    if isinstance(e, anthropic.APIStatusError):
+        return f"API ответил ошибкой {e.status_code}: {str(e.message)[:200]}"
+    return f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def claude_down_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    problem = context.application.bot_data.get("claude_error")
+    return "Claude сейчас недоступен 😕" + (f" Причина: {problem}." if problem else "")
+
+
 async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
                                 text: str, heard: str, files: list[dict] | None = None,
                                 label: str = "") -> bool:
@@ -330,9 +355,10 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
     tools = make_tools(context, chat)
     try:
         reply_text = await assistant.handle(chat.chat_id, text, tools, files, label)
-    except Exception:
+    except Exception as e:
         if not (tools.changed or tools.deleted_events):
             log.exception("Claude недоступен")
+            context.application.bot_data["claude_error"] = claude_problem(e)
             return False
         log.exception("Claude оборвался после изменений")
         reply_text = "Изменения внесены, но ответ не получился. Проверьте /list."
@@ -360,7 +386,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     if await handle_with_assistant(update, context, chat, text, heard):
         return
     if context.application.bot_data.get("assistant") is not None:
-        await reply(update, heard + "Claude сейчас недоступен 😕 Попробуйте через минуту — "
+        await reply(update, heard + claude_down_text(context) + " Попробуйте через минуту — "
                                     "или посмотрите дела: /list")
         return
     # Без Claude: каждое сообщение — дело без срока.
@@ -405,6 +431,10 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data = bytes(await (await document.get_file()).download_as_bytearray())
         if await save_calendar_key(update, context, data):
             return
+        if b"PRIVATE KEY" in data:  # ключи и пароли в Claude не отправляем
+            await message.reply_text("В файле закрытый ключ, но это не ключ служебного аккаунта Google. "
+                                     "Такие файлы никуда не отправляю.")
+            return
     if context.application.bot_data.get("assistant") is None:
         await message.reply_text("Чтобы разбирать фото и файлы, боту нужен Claude (ANTHROPIC_API_KEY).")
         return
@@ -429,8 +459,8 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     text = message.caption or "Посмотри, что здесь, и помоги разобраться."
     if not await handle_with_assistant(update, context, chat, text, "", [block], name):
-        await message.reply_text("Не получилось разобрать файл: Claude сейчас недоступен. "
-                                 "Попробуйте чуть позже.")
+        await message.reply_text("Не получилось разобрать файл. " + claude_down_text(context)
+                                 + " Попробуйте чуть позже.")
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

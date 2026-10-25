@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import anthropic
+import httpx
 import pytest
 from conftest import Sent, fake_assistant, fake_context, fake_update, run, text, tool_use
 from telegram.ext import ApplicationHandlerStop
@@ -79,11 +81,20 @@ def test_several_tasks_no_inline_keyboard():
     assert [t.title for t in s.open_tasks(1)] == ["Молоко", "Хлеб"]
 
 
-def test_claude_down():
+def test_claude_down_says_why():
     s = Storage(":memory:")
-    a = fake_assistant([RuntimeError("timeout")])
-    assert "Claude сейчас недоступен" in say(s, a, "купить хлеб").texts
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    a = fake_assistant([anthropic.APIConnectionError(request=request)])
+    assert "Claude сейчас недоступен 😕 Причина: нет связи с API Anthropic — проверьте прокси" \
+        in say(s, a, "купить хлеб").texts
     assert s.open_tasks(1) == []
+
+    response = httpx.Response(400, request=request)
+    low = anthropic.BadRequestError("Your credit balance is too low", response=response, body=None)
+    assert "ошибкой 400: Your credit balance is too low" in bot.claude_problem(low)
+    auth = anthropic.AuthenticationError("invalid x-api-key", response=httpx.Response(401, request=request),
+                                         body=None)
+    assert bot.claude_problem(auth) == "ключ ANTHROPIC_API_KEY не подходит"
 
 
 def test_without_claude_text_becomes_task():
