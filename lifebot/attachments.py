@@ -8,9 +8,9 @@ import io
 from pathlib import PurePath
 
 MAX_SIDE = 2576  # больше модели всё равно не используют
-MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_IMAGE_BYTES = 3_500_000  # API принимает до 5 МБ в base64, это ≈3,7 МБ файла
 MAX_TEXT_CHARS = 200_000
-IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 TEXT_EXTENSIONS = {".txt", ".csv", ".tsv", ".json", ".md", ".log"}
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 
@@ -19,12 +19,17 @@ class UnsupportedFile(ValueError):
     pass
 
 
-def _fit_image(data: bytes, media_type: str) -> tuple[bytes, str]:
-    """Уменьшает большую картинку до MAX_SIDE по длинной стороне; маленькие не трогает."""
+FORMATS = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
+
+
+def _fit_image(data: bytes) -> tuple[bytes, str]:
+    """Картинка для API: тип — по содержимому файла, а не по имени (иначе API отклонит запрос);
+    большие уменьшаются до MAX_SIDE по длинной стороне и пережимаются в JPEG."""
     from PIL import Image
 
     with Image.open(io.BytesIO(data)) as img:
-        if max(img.size) <= MAX_SIDE and len(data) <= MAX_IMAGE_BYTES:
+        media_type = FORMATS.get(img.format or "")
+        if media_type and max(img.size) <= MAX_SIDE and len(data) <= MAX_IMAGE_BYTES:
             return data, media_type
         img.thumbnail((MAX_SIDE, MAX_SIDE))
         out = io.BytesIO()
@@ -58,9 +63,9 @@ def to_block(name: str, mime: str | None, data: bytes) -> dict:
     """Блок содержимого для Messages API. UnsupportedFile — если такой файл не понимаем."""
     ext = PurePath(name).suffix.lower()
     mime = (mime or "").lower()
-    if mime in IMAGE_TYPES or ext in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+    if mime.startswith("image/") or ext in IMAGE_EXTENSIONS:
         try:
-            data, mime = _fit_image(data, mime if mime in IMAGE_TYPES else "image/jpeg")
+            data, mime = _fit_image(data)
         except Exception as e:
             raise UnsupportedFile("Не получилось открыть картинку.") from e
         return {"type": "image", "source": {"type": "base64", "media_type": mime,

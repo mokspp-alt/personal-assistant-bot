@@ -2,6 +2,7 @@
 
 import base64
 import io
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,27 @@ def test_big_image_downscaled():
     assert block["source"]["media_type"] == "image/jpeg"
     with Image.open(io.BytesIO(base64.b64decode(block["source"]["data"]))) as img:
         assert max(img.size) == attachments.MAX_SIDE
+
+
+def test_image_type_from_content():
+    # Скриншот PNG, присланный с именем .jpg и типом image/jpeg: API отклонил бы несовпадение.
+    block = attachments.to_block("Screenshot.jpg", "image/jpeg", png(1080, 2400))
+    assert block["source"]["media_type"] == "image/png"
+    # BMP API не понимает — пережимаем в JPEG.
+    out = io.BytesIO()
+    Image.new("RGB", (100, 100), "white").save(out, "BMP")
+    block = attachments.to_block("скан.bmp", "image/bmp", out.getvalue())
+    assert block["type"] == "image" and block["source"]["media_type"] == "image/jpeg"
+
+
+def test_heavy_image_recompressed():
+    noisy = Image.frombytes("RGB", (2000, 2000), os.urandom(2000 * 2000 * 3))
+    out = io.BytesIO()
+    noisy.save(out, "PNG")
+    assert len(out.getvalue()) > attachments.MAX_IMAGE_BYTES
+    block = attachments.to_block("тяжёлый.png", "image/png", out.getvalue())
+    assert block["source"]["media_type"] == "image/jpeg"
+    assert len(base64.b64decode(block["source"]["data"])) <= attachments.MAX_IMAGE_BYTES
 
 
 def test_pdf_text_and_excel():
